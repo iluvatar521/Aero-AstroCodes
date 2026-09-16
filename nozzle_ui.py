@@ -6,9 +6,10 @@ Requires: numpy, scipy, matplotlib  (pip install numpy scipy matplotlib)
 
 Run with:  python nozzle_ui.py
 This interactive simulator makes the theory tangible - dragging sliders for geometry, stagnation conditions, and back pressure shows the flow regime shift in real time - unchoked, shock-in-duct, over-expanded, perfectly expanded -
-while the schematic redraws shock locations and expansion fans instantly. 
-Watching Mach, pressure, and temperature profiles update alongside the governing equations connects abstract math to physical intuition far better than static diagrams. 
+while the schematic redraws shock locations and expansion fans instantly.
+Watching Mach, pressure, and temperature profiles update alongside the governing equations connects abstract math to physical intuition far better than static diagrams.
 The three critical back-pressure thresholds become tangible boundaries rather than numbers, building the intuition engineers need to design real propulsion and flow systems.
+
 """
 
 import math
@@ -25,7 +26,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 
 # ======================================================================
-#  GAS-DYNAMICS FUNCTIONS  
+#  GAS-DYNAMICS FUNCTIONS
 # ======================================================================
 
 class NozzleError(Exception):
@@ -199,7 +200,102 @@ def oblique_from_theta(M1, theta, gamma):
 
 
 # ======================================================================
-#  CORE COMPUTATION  
+#  WALL GEOMETRY: CONE / CIRCULAR-ARC-FILLET / CONE
+# ======================================================================
+
+def solve_throat_fillet(A1, At, Ae, Lconv, Ldiv, Rc):
+    """
+    Build a wall-radius profile r(x) for x in [-Lconv, Ldiv] made of:
+        - a straight cone from (-Lconv, r1) to a tangent point (x1, r(x1))
+        - a circular arc of radius Rc, centered on the axis at (0, rt+Rc),
+          running from x1 through the throat (x=0, r=rt) to x2
+        - a straight cone from the tangent point (x2, r(x2)) to (Ldiv, re)
+
+    The SAME arc carries the wall across the sonic point, so curvature
+    (d^2r/dx^2) is continuous through the throat -- this is what removes
+    the artificial Mach/pressure/temperature kink at M=1.
+
+    The tangent stations x1 (<0) and x2 (>0) are found by solving the
+    tangency condition "line slope == arc slope" directly with brentq,
+    which is equivalent to (and simpler than) the general external-point-
+    to-circle tangent-line construction, because we only ever need the
+    tangent point on the lower arc r = yc - sqrt(Rc^2 - x^2).
+
+    Returns
+    -------
+    r_of_x : callable, vectorized, valid on [-Lconv, Ldiv]
+    x1, x2 : tangent stations (x1 < 0 < x2)
+    rt     : throat radius (sanity return)
+    """
+    r1 = math.sqrt(A1 / math.pi)
+    rt = math.sqrt(At / math.pi)
+    re = math.sqrt(Ae / math.pi)
+
+    if Rc <= 0:
+        raise NozzleError("Throat fillet radius Rc must be positive.")
+    if Rc >= Lconv or Rc >= Ldiv:
+        raise NozzleError(
+            f"Throat fillet radius Rc={Rc:.4g} m is too large for the plotted "
+            f"duct lengths (Lconv={Lconv:.4g} m, Ldiv={Ldiv:.4g} m). Reduce "
+            f"Rc/rt or increase Lconv/Ldiv."
+        )
+
+    yc = rt + Rc
+
+    def upstream_eq(x1):
+        s = math.sqrt(max(Rc ** 2 - x1 ** 2, 1e-14))
+        r_x1 = yc - s
+        m1 = x1 / s
+        line_slope = (r_x1 - r1) / (x1 - (-Lconv))
+        return line_slope - m1
+
+    def downstream_eq(x2):
+        s = math.sqrt(max(Rc ** 2 - x2 ** 2, 1e-14))
+        r_x2 = yc - s
+        m2 = x2 / s
+        line_slope = (re - r_x2) / (Ldiv - x2)
+        return line_slope - m2
+
+    eps = 1e-9 * Rc
+    try:
+        x1 = brentq(upstream_eq, -Rc + eps, -eps)
+        x2 = brentq(downstream_eq, eps, Rc - eps)
+    except ValueError:
+        raise NozzleError(
+            "Cannot fit the requested throat fillet radius into the given "
+            "geometry (Rc too large relative to A1/At/Ae, or Lconv/Ldiv too "
+            "short). Try reducing Rc/rt or increasing Lconv/Ldiv."
+        )
+
+    if not (-Lconv < x1 < 0) or not (0 < x2 < Ldiv):
+        raise NozzleError(
+            "Throat fillet tangent points fall outside the plotted duct "
+            "length. Reduce Rc/rt or increase Lconv/Ldiv."
+        )
+
+    r_x1 = yc - math.sqrt(Rc ** 2 - x1 ** 2)
+    r_x2 = yc - math.sqrt(Rc ** 2 - x2 ** 2)
+    m1 = x1 / math.sqrt(Rc ** 2 - x1 ** 2)
+    m2 = x2 / math.sqrt(Rc ** 2 - x2 ** 2)
+
+    def r_of_x(x):
+        x = np.atleast_1d(np.asarray(x, dtype=float))
+        r = np.empty_like(x)
+        left = x <= x1
+        right = x >= x2
+        mid = ~left & ~right
+
+        r[left] = r1 + m1 * (x[left] - (-Lconv))
+        r[right] = r_x2 + m2 * (x[right] - x2)
+        xm = x[mid]
+        r[mid] = yc - np.sqrt(np.clip(Rc ** 2 - xm ** 2, 0.0, None))
+        return r
+
+    return r_of_x, x1, x2, rt
+
+
+# ======================================================================
+#  CORE COMPUTATION
 # ======================================================================
 
 def compute_nozzle(P):
@@ -224,11 +320,14 @@ def compute_nozzle(P):
         Pb = P["Pb"]
         Lconv = P["Lconv"]
         Ldiv = P["Ldiv"]
+        RcRatio = P["RcRatio"]
 
         if gamma <= 1:
             raise NozzleError("gamma must be greater than 1.")
         if R <= 0:
             raise NozzleError("Gas constant R must be positive.")
+        if RcRatio <= 0:
+            raise NozzleError("Throat fillet ratio Rc/rt must be positive.")
 
         if supersonic_inlet:
             M1_in = P["M1"]
@@ -331,11 +430,18 @@ def compute_nozzle(P):
             AstarEff = At
             mdot = choked_mass_flow(At, P0, T0, gamma, R)
 
+        # ---- wall geometry: cone / circular-arc fillet / cone ----
+        rt = math.sqrt(At / math.pi)
+        Rc = RcRatio * rt
+        r_of_x, xt1, xt2, _ = solve_throat_fillet(A1, At, Ae, Lconv, Ldiv, Rc)
+
         # summary log
         L("=========================================================")
         L(" QUASI-1D CD NOZZLE ANALYSIS SUMMARY")
         L("=========================================================")
         L(" Geometry : A1=%.5g m^2   At=%.5g m^2   Ae=%.5g m^2   (Ae/At=%.4f)", A1, At, Ae, epsE)
+        L(" Throat fillet: Rc=%.5g m (Rc/rt=%.3f)   tangent stations x1=%.5g m, x2=%.5g m",
+          Rc, RcRatio, xt1, xt2)
         L(" Plenum   : P0=%.5g Pa    T0=%.5g K", P0, T0)
         L(" Back P.  : Pb=%.5g Pa", Pb)
         L("")
@@ -364,8 +470,10 @@ def compute_nozzle(P):
         xDiv = np.linspace(0, Ldiv, Nd)
         x = np.concatenate([xConv, xDiv[1:]])
 
-        Aconv = At + (A1 - At) * (xConv / (-Lconv)) ** 2
-        Adiv = At + (Ae - At) * (xDiv / Ldiv) ** 2
+        rConv = r_of_x(xConv)
+        rDiv = r_of_x(xDiv)
+        Aconv = math.pi * rConv ** 2
+        Adiv = math.pi * rDiv ** 2
         Ax = np.concatenate([Aconv, Adiv[1:]])
 
         Mx = np.zeros_like(x)
@@ -395,7 +503,18 @@ def compute_nozzle(P):
 
             if regime == "Normal shock inside the diverging section":
                 Astar2 = Ash / area_ratio(M2s, gamma)
-                xshock = Ldiv * math.sqrt(max((Ash - At), 0.0) / (Ae - At))
+
+                rsh = math.sqrt(Ash / math.pi)
+
+                def _r_resid(xx):
+                    return float(r_of_x(xx)[0]) - rsh
+
+                try:
+                    xshock = brentq(_r_resid, 0.0, Ldiv)
+                except ValueError:
+                    # fallback (should not normally trigger): monotone area assumption
+                    xshock = Ldiv * math.sqrt(max((Ash - At), 0.0) / (Ae - At))
+
                 for j in range(1, Nd):
                     k = Nc + j - 1
                     if xDiv[j] < xshock:
@@ -481,6 +600,7 @@ def compute_nozzle(P):
             regime=regime, Nc=Nc,
             rWall=rWall, rExit=rExit,
             xshock=xshock, Ash=Ash,
+            xt1=xt1, xt2=xt2, Rc=Rc,
             nValid=nValid, cellPR=cellPR, cellWaveType=cellWaveType,
             cellMstart=cellMstart, cellMend=cellMend,
             supersonicInlet=supersonic_inlet, M1_inlet=M1_inlet,
@@ -507,6 +627,7 @@ def default_params():
     return dict(
         gamma=1.4, R=287.0, supersonicInlet=False,
         M1=2.0, A1=0.050, At=0.020, Ae=0.040,
+        RcRatio=1.0,
         P0=1.0e6, T0=800.0, Pb=3.0e5,
         Lconv=0.10, Ldiv=0.20,
     )
@@ -527,6 +648,11 @@ def draw_schematic(ax, res):
              label="Nozzle wall")
     ax.plot([x[0], x[-1]], [0, 0], "k-.", linewidth=0.75)
     ax.plot([0, 0], [-rWall[Nc - 1], rWall[Nc - 1]], "k:", linewidth=1.1, label="Throat")
+
+    xt1, xt2 = res.get("xt1"), res.get("xt2")
+    if xt1 is not None and xt2 is not None and not (math.isnan(xt1) or math.isnan(xt2)):
+        ax.axvline(xt1, color=(0.0, 0.5, 0.0), linestyle=":", linewidth=0.9, label="Fillet tangency")
+        ax.axvline(xt2, color=(0.0, 0.5, 0.0), linestyle=":", linewidth=0.9)
 
     if res["supersonicInlet"]:
         inlet_label = f"M_1={res['M1_inlet']:.2f} (supersonic inlet)"
@@ -749,6 +875,8 @@ class NozzleUI:
         self.rows["A1"] = ParamRow(frame, r, "Inlet area A1 [m^2]", 0.001, 0.3, P["A1"], "%.4f"); r += 1
         self.rows["At"] = ParamRow(frame, r, "Throat area At [m^2]", 5e-4, 0.15, P["At"], "%.4f"); r += 1
         self.rows["Ae"] = ParamRow(frame, r, "Exit area Ae [m^2]", 0.001, 0.4, P["Ae"], "%.4f"); r += 1
+        self.rows["RcRatio"] = ParamRow(frame, r, "Throat fillet radius, Rc/r_t [-]", 0.05, 3.0,
+                                         P["RcRatio"], "%.3f"); r += 1
         self.rows["P0"] = ParamRow(frame, r, "Stagnation pressure P0 [Pa]", 1e4, 5e6, P["P0"], "%.0f",
                                     post_fcn=self._on_p0_changed); r += 1
         self.rows["T0"] = ParamRow(frame, r, "Stagnation temperature T0 [K]", 100, 3000, P["T0"], "%.1f"); r += 1
@@ -794,6 +922,7 @@ class NozzleUI:
             A1=self.rows["A1"].get(),
             At=self.rows["At"].get(),
             Ae=self.rows["Ae"].get(),
+            RcRatio=self.rows["RcRatio"].get(),
             P0=self.rows["P0"].get(),
             T0=self.rows["T0"].get(),
             Pb=self.rows["Pb"].get(),
@@ -817,7 +946,7 @@ class NozzleUI:
         D = default_params()
         self.supersonic_var.set(D["supersonicInlet"])
         self.rows["Pb"].set_limits(0, D["P0"])
-        for name in ("gamma", "R", "M1", "A1", "At", "Ae", "P0", "T0", "Pb", "Lconv", "Ldiv"):
+        for name in ("gamma", "R", "M1", "A1", "At", "Ae", "RcRatio", "P0", "T0", "Pb", "Lconv", "Ldiv"):
             self.rows[name].set(D[name])
         self._set_inlet_enable(D["supersonicInlet"])
         self.on_run()
