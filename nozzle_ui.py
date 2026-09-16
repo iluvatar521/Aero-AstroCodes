@@ -201,7 +201,7 @@ def oblique_from_theta(M1, theta, gamma):
 def compute_nozzle(P):
     """
     Given a dict of parameters P (see default_params()), return
-    (log_str, res_dict, ok).  Mirrors the MATLAB computeNozzle function.
+    (log_str, res_dict, ok). 
     """
     log_lines = []
 
