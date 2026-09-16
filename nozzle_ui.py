@@ -5,6 +5,10 @@ nozzle_ui.py
 Requires: numpy, scipy, matplotlib  (pip install numpy scipy matplotlib)
 
 Run with:  python nozzle_ui.py
+This interactive simulator makes the theory tangible - dragging sliders for geometry, stagnation conditions, and back pressure shows the flow regime shift in real time - unchoked, shock-in-duct, over-expanded, perfectly expanded -
+while the schematic redraws shock locations and expansion fans instantly. 
+Watching Mach, pressure, and temperature profiles update alongside the governing equations connects abstract math to physical intuition far better than static diagrams. 
+The three critical back-pressure thresholds become tangible boundaries rather than numbers, building the intuition engineers need to design real propulsion and flow systems.
 """
 
 import math
